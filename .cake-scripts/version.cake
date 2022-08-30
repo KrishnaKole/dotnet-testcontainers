@@ -15,13 +15,19 @@ internal sealed class BuildInformation
   public bool IsPullRequest { get; private set; }
   public bool ShouldPublish { get; private set; }
 
-  public static BuildInformation Instance(ICakeContext context)
+  public static BuildInformation Instance(ICakeContext context, string propertiesFilePath)
   {
-    var isFork = context.EnvironmentVariable("SYSTEM_PULLREQUEST_ISFORK", "False");
+    var buildSystem = context.BuildSystem();
 
-    var buildReason = context.EnvironmentVariable("BUILD_REASON", string.Empty);
+    var environment = buildSystem.GitHubActions.Environment;
 
-    var buildNumber = context.EnvironmentVariable("BUILD_BUILDNUMBER", string.Empty);
+    var isLocalBuild = buildSystem.IsLocalBuild;
+
+    var isPullRequest = environment.PullRequest.IsPullRequest;
+
+    var isFork = "fork".Equals(environment.Workflow.EventName, StringComparison.OrdinalIgnoreCase);
+
+    var buildId = environment.Workflow.RunId;
 
     var git = context.GitBranchCurrent(".");
 
@@ -29,41 +35,37 @@ internal sealed class BuildInformation
 
     var sha = git.Tip.Sha;
 
-    var branch = string.Empty;
+    string branch;
+
+    string pullRequestId = "0";
 
     string sourceBranch = null;
 
     string targetBranch = null;
 
-    string pullRequestId = null;
-
-    var isPullRequest = "PullRequest".Equals(buildReason);
-
-    if (isPullRequest)
+    if (isLocalBuild)
     {
-      branch = context.EnvironmentVariable("SYSTEM_PULLREQUEST_SOURCEBRANCH", git.FriendlyName);
-      sourceBranch = context.EnvironmentVariable("SYSTEM_PULLREQUEST_SOURCEBRANCH");
-      targetBranch = context.EnvironmentVariable("SYSTEM_PULLREQUEST_TARGETBRANCH");
-      pullRequestId = context.EnvironmentVariable("SYSTEM_PULLREQUEST_PULLREQUESTNUMBER");
-      sourceBranch = sourceBranch?.Replace("refs/heads/", string.Empty);
-      targetBranch = targetBranch?.Replace("refs/heads/", string.Empty);
+      branch = git.FriendlyName;
     }
     else
     {
-      branch = context.EnvironmentVariable("BUILD_SOURCEBRANCH", git.FriendlyName);
+      branch = environment.Workflow.RefName;
     }
 
-    branch = branch.Replace("refs/heads/", string.Empty);
+    if (isPullRequest)
+    {
+      pullRequestId = new string(environment.Workflow.Ref.Where(char.IsDigit).ToArray());
+      sourceBranch = environment.Workflow.HeadRef;
+      targetBranch = environment.Workflow.BaseRef;
+    }
 
-    var version = context.XmlPeek("src/Shared.msbuild", "/Project/PropertyGroup[1]/Version/text()");
-
-    var isLocalBuild = context.BuildSystem().IsLocalBuild;
+    var version = context.XmlPeek(propertiesFilePath, "/Project/PropertyGroup[2]/Version/text()");
 
     var isReleaseBuild = GetIsReleaseBuild(branch);
 
-    var shouldPublish = GetShouldPublish(branch);
+    var shouldPublish = GetShouldPublish(branch) && "true".Equals(context.EnvironmentVariable("PUBLISH_NUGET_PACKAGE"), StringComparison.OrdinalIgnoreCase);
 
-    if (bool.Parse(isFork) && isPullRequest && shouldPublish)
+    if (isFork && isPullRequest && shouldPublish)
     {
       throw new ArgumentException("Use 'feature/' or 'bugfix/' prefix for pull request branches.");
     }
@@ -73,9 +75,9 @@ internal sealed class BuildInformation
       version = $"{version}-beta";
     }
 
-    if (!isReleaseBuild && !string.IsNullOrEmpty(buildNumber))
+    if (!isReleaseBuild && !string.IsNullOrEmpty(buildId))
     {
-      version = $"{version}.{buildNumber}";
+      version = $"{version}.{buildId}";
     }
 
     return new BuildInformation

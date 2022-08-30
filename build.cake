@@ -1,12 +1,12 @@
-#tool nuget:?package=dotnet-sonarscanner&version=5.1.0
+#tool nuget:?package=dotnet-sonarscanner&version=5.7.2
 
-#addin nuget:?package=Cake.Sonar&version=1.1.25
+#addin nuget:?package=Cake.Sonar&version=1.1.29
 
-#addin nuget:?package=Cake.Git&version=1.0.1
+#addin nuget:?package=Cake.Git&version=2.0.0
 
 #load ".cake-scripts/parameters.cake"
 
-readonly var param = BuildParameters.Instance(Context, "DotNet.Testcontainers");
+readonly var param = BuildParameters.Instance(Context);
 
 Setup(context =>
 {
@@ -14,13 +14,10 @@ Setup(context =>
 
   foreach (var project in param.Projects.All)
   {
-    toClean.Add(project.Path.GetDirectory().Combine("obj"));
-    toClean.Add(project.Path.GetDirectory().Combine("bin"));
-    toClean.Add(project.Path.GetDirectory().Combine("Release"));
-    toClean.Add(project.Path.GetDirectory().Combine("Debug"));
+    toClean.Add("build");
   }
 
-  Information("Building version {0} of .NET Testcontainers ({1}@{2})", param.Version, param.Branch, param.Sha);
+  Information("Building version {0} of Testcontainers ({1}@{2})", param.Version, param.Branch, param.Sha);
 });
 
 Teardown(context =>
@@ -46,7 +43,7 @@ Task("Clean")
 Task("Restore-NuGet-Packages")
   .Does(() =>
 {
-  DotNetCoreRestore(param.Solution, new DotNetCoreRestoreSettings
+  DotNetRestore(param.Solution, new DotNetRestoreSettings
   {
     Verbosity = param.Verbosity
   });
@@ -64,7 +61,7 @@ Task("Build-Information")
 Task("Build")
   .Does(() =>
 {
-  DotNetCoreBuild(param.Solution, new DotNetCoreBuildSettings
+  DotNetBuild(param.Solution, new DotNetBuildSettings
   {
     Configuration = param.Configuration,
     Verbosity = param.Verbosity,
@@ -79,7 +76,7 @@ Task("Tests")
 {
   foreach(var testProject in param.Projects.OnlyTests)
   {
-    DotNetCoreTest(testProject.Path.FullPath, new DotNetCoreTestSettings
+    DotNetTest(testProject.Path.FullPath, new DotNetTestSettings
     {
       Configuration = param.Configuration,
       Verbosity = param.Verbosity,
@@ -87,11 +84,13 @@ Task("Tests")
       NoBuild = true,
       Loggers = new[] { "trx" },
       Filter = param.TestFilter,
-      ResultsDirectory = param.Paths.Directories.TestResults,
+      ResultsDirectory = param.Paths.Directories.TestResultsDirectoryPath,
       ArgumentCustomization = args => args
+        .Append("/p:Platform=AnyCPU")
         .Append("/p:CollectCoverage=true")
-        .Append("/p:CoverletOutputFormat=opencover")
-        .Append($"/p:CoverletOutput=\"{MakeAbsolute(param.Paths.Directories.TestCoverage)}/\"")
+        .Append("/p:CoverletOutputFormat=\"json%2copencover\"") // https://github.com/coverlet-coverage/coverlet/pull/220#issuecomment-431507570.
+        .Append($"/p:MergeWith=\"{MakeAbsolute(param.Paths.Directories.TestCoverageDirectoryPath)}/coverage.json\"")
+        .Append($"/p:CoverletOutput=\"{MakeAbsolute(param.Paths.Directories.TestCoverageDirectoryPath)}/\"")
     });
   }
 });
@@ -111,12 +110,12 @@ Task("Sonar-Begin")
     Version = param.Version.Substring(0, 5),
     PullRequestProvider = "GitHub",
     PullRequestGithubEndpoint = "https://api.github.com/",
-    PullRequestGithubRepository = "HofmeisterAn/dotnet-testcontainers",
-    PullRequestKey = System.Int32.TryParse(param.PullRequestId, out var id) ? id : (int?)null,
+    PullRequestGithubRepository = "testcontainers/testcontainers-dotnet",
+    PullRequestKey = param.IsPullRequest && System.Int32.TryParse(param.PullRequestId, out var id) ? id : (int?)null,
     PullRequestBranch = param.SourceBranch,
     PullRequestBase = param.TargetBranch,
-    VsTestReportsPath = $"{MakeAbsolute(param.Paths.Directories.TestResults)}/*.trx",
-    OpenCoverReportsPath = $"{MakeAbsolute(param.Paths.Directories.TestCoverage)}/*.opencover.xml"
+    VsTestReportsPath = $"{MakeAbsolute(param.Paths.Directories.TestResultsDirectoryPath)}/*.trx",
+    OpenCoverReportsPath = $"{MakeAbsolute(param.Paths.Directories.TestCoverageDirectoryPath)}/*.opencover.xml"
   });
 });
 
@@ -134,17 +133,34 @@ Task("Create-NuGet-Packages")
   .WithCriteria(() => param.ShouldPublish)
   .Does(() =>
 {
-  DotNetCorePack(param.Projects.Testcontainers.Path.FullPath, new DotNetCorePackSettings
+  DotNetPack(param.Projects.Testcontainers.Path.FullPath, new DotNetPackSettings
   {
     Configuration = param.Configuration,
     Verbosity = param.Verbosity,
     NoRestore = true,
     NoBuild = true,
     IncludeSymbols = true,
-    OutputDirectory = param.Paths.Directories.NugetRoot,
+    OutputDirectory = param.Paths.Directories.NuGetDirectoryPath,
     ArgumentCustomization = args => args
-      .Append($"/p:Version={param.Version}")
+      .Append("/p:Platform=AnyCPU")
       .Append("/p:SymbolPackageFormat=snupkg")
+      .Append($"/p:Version={param.Version}")
+  });
+});
+
+Task("Sign-NuGet-Packages")
+  .WithCriteria(() => param.ShouldPublish)
+  .Does(() =>
+{
+  StartProcess("dotnet", new ProcessSettings
+  {
+    Arguments = new ProcessArgumentBuilder()
+      .Append("nuget")
+      .Append("sign")
+      .AppendSwitchQuoted("--certificate-path", param.Paths.Files.CodeSigningCertificateFilePath.FullPath)
+      .AppendSwitchQuoted("--certificate-password", param.CodeSigningCertificateCredentials.Password)
+      .AppendSwitchQuoted("--timestamper", "http://ts.quovadisglobal.com/eu")
+      .Append($"{MakeAbsolute(param.Paths.Directories.NuGetDirectoryPath)}/**/*.nupkg")
   });
 });
 
@@ -152,9 +168,9 @@ Task("Publish-NuGet-Packages")
   .WithCriteria(() => param.ShouldPublish)
   .Does(() =>
 {
-  foreach(var package in GetFiles($"{param.Paths.Directories.NugetRoot}/*.(nupkg|snupkgs)"))
+  foreach(var package in GetFiles($"{param.Paths.Directories.NuGetDirectoryPath}/*.(nupkg|snupkgs)"))
   {
-    DotNetCoreNuGetPush(package.FullPath, new DotNetCoreNuGetPushSettings
+    DotNetNuGetPush(package.FullPath, new DotNetNuGetPushSettings
     {
       Source = param.NuGetCredentials.Source,
       ApiKey = param.NuGetCredentials.ApiKey
